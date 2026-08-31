@@ -1,0 +1,83 @@
+/*
+   Lesson 1a : Non-Blocking Continuous Stepper Engine
+   Basic stepper code architecture to a constant-infinite speed
+   Author: Harwell Mejia
+   Tutor: GEMINI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Hardware: 
+   - Arduino UNO
+   - Stepper NEMA 17 
+   - A4988 Stepper driver
+   Compiled and run in WOKWI
+*/
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+
+//==Stepper global state parameters==
+bool stepState = LOW;
+unsigned long stepInterval;
+const unsigned int rpm = 60;
+unsigned long totalSteps = 0; //Steps tracking 
+
+//==Non blocking timer
+unsigned long lastStepTime = 0;
+
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 250;
+
+void setup(){
+  Serial.begin(115200);
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+
+  //Initial state
+  digitalWrite(dirPin, HIGH); // For clockwise rotation
+  digitalWrite(stepPin, LOW);
+
+  stepInterval = 60000000UL / (rpm * stepsPerRev * 2.);
+
+  lastStepTime = micros();
+  lastSerialTime = millis();
+
+  //==Starting telemetry
+  Serial.println("\nWelcome to Arduino - State Machine Series");
+  Serial.println("By: Harwell");
+  Serial.print("Pulse Interval: ");
+  Serial.print(stepInterval);
+  Serial.print(" | ");
+  Serial.print("RPM: ");
+  Serial.println(rpm);
+}
+
+void loop(){
+  //==Task 1 - Non-blocking stepper timer==
+  unsigned long currentStepTime = micros();
+  if(currentStepTime - lastStepTime >= stepInterval){
+    lastStepTime += stepInterval;
+    stepState = !stepState;
+    digitalWrite(stepPin, stepState);
+
+    //Counting steps
+    if(stepState == HIGH){
+      totalSteps++;
+    }
+  }
+
+  //==Task 2 - Non-blocking Serial Telemetry==
+  unsigned long currentSerialTime = millis();
+  if(currentSerialTime - lastSerialTime >= serialInterval){
+    lastSerialTime += serialInterval;
+
+    //== Data verification ==
+    float totalRevs = (float)totalSteps / stepsPerRev;
+    Serial.print("Revolutions: ");
+    Serial.print(totalRevs);
+    Serial.print(" | ");
+    Serial.print("Steps: ");
+    Serial.println(totalSteps);
+  }
+}
