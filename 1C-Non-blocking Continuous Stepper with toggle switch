@@ -1,0 +1,179 @@
+/*
+   Lesson 1c : Non-Blocking Continuous Stepper Engine
+   Basic stepper code architecture to a constant-infinite speed
+   Non blocking toggle switch
+   Non-blocking LCD refresh
+
+   Author: Harwell Mejia
+   Tutor: GEMINI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+   Hardware: 
+   - Arduino UNO
+   - Stepper NEMA 17 
+   - A4988 Stepper driver
+   - LCD 16x2 + I2C driver
+   Compiled and run in WOKWI
+   Simulation link:
+   https://wokwi.com/projects/473681933084427265
+*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+#define redPin 4
+#define greenPin 5
+#define BTN_PIN 6
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//==Global state variables==
+bool systemState = LOW;
+bool stepState = LOW;
+unsigned long totalSteps = 0; //Counting step parameter
+const unsigned int rpm = 120;
+
+//==Non-blocking timers ==
+unsigned long lastStepTime = 0;
+unsigned long stepInterval;
+
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 250;
+
+unsigned long lastLCDTime = 0;
+const unsigned long lcdInterval = 250;
+
+//== Toggle switch parameters
+bool lastBTNRead = HIGH;
+bool stableBTNState = HIGH;
+unsigned long btnBounceTime = 0;
+const unsigned long btnDebounceDelay = 50;
+
+void setup(){
+  Serial.begin(115200);
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  lcd.begin(16,2);
+  lcd.backlight();
+
+  //Starting mode
+  stepInterval = 60000000UL / (rpm * stepsPerRev * 2.); //Calculating half-pulse intervals
+  digitalWrite(dirPin, HIGH); //Set direction
+  digitalWrite(stepPin, LOW); // stepper Off when started
+
+  digitalWrite(redPin, !systemState);
+  digitalWrite(greenPin, systemState);
+  
+  //last time start counting
+  lastStepTime = micros();
+  lastSerialTime = millis();
+  lastLCDTime = millis();
+
+  //Telemetry
+  Serial.println("Welcome to Arduino - State Machines");
+  Serial.println("By Harwell Mejia");
+  Serial.print("RPM: ");
+  Serial.print(rpm);
+  Serial.print("  | half-Pulse interval: ");
+  Serial.println(stepInterval);
+
+  lcd.setCursor(0,0);
+  lcd.print("Hi Arduino");
+  lcd.setCursor(0,1);
+  lcd.print("Press to start");
+
+}
+
+void loop(){
+  //==Task 1 - Activate toggle switch
+  bool currentBTNRead = digitalRead(BTN_PIN);
+  //1.1 Detect electrical change 
+  if(currentBTNRead != lastBTNRead){
+    lastBTNRead = currentBTNRead;
+    btnBounceTime = millis();
+  }
+  //1.2 Verify debounce Stability
+  unsigned long currentBTNTime = millis();
+  if(currentBTNTime - btnBounceTime >= btnDebounceDelay){
+    bool verifiedRead = digitalRead(BTN_PIN);
+    //1.3 Check stable state
+    if(verifiedRead != stableBTNState){
+      stableBTNState = verifiedRead;
+      //1.4 Valid button press
+      if(stableBTNState == LOW){
+        systemState = !systemState;
+        digitalWrite(redPin, !systemState);
+        digitalWrite(greenPin, systemState);
+
+        Serial.print("System: ");
+        Serial.println(systemState? "ON":"OFF");
+
+        if(systemState == HIGH){
+          totalSteps = 0; // Reset the counter when press to start
+          lastStepTime = micros(); //Reset the BTN counter when press to start
+          digitalWrite(stepPin, stepState);
+        }
+        else{
+          stepState = LOW;
+          digitalWrite(stepPin, stepState);
+          
+          lcd.setCursor(0,0);
+          lcd.print("System OFF");
+          lcd.print("               ");
+
+          lcd.setCursor(0,1);
+          lcd.print("Press to start");
+        }
+      }
+    }
+  }
+  //if the push button is press and the system is HIGH
+  if(systemState == HIGH){
+    //==Task 2- Activate stepper 
+    unsigned long currentStepTime = micros();
+    if(currentStepTime - lastStepTime >= stepInterval){
+      lastStepTime += stepInterval;
+
+      stepState = !stepState;
+      digitalWrite(stepPin, stepState);
+      //Counting steps
+      if(stepState == HIGH){
+        totalSteps++;
+      }
+    }
+
+    //==Task 3 - Non-blocking Serial telemetry
+    unsigned long currentSerialTime = millis();
+    if(currentSerialTime - lastSerialTime >= serialInterval){
+      lastSerialTime += serialInterval;
+
+      float totalRevs = (float)totalSteps / stepsPerRev;
+      Serial.print("Revolutions: ");
+      Serial.print(totalRevs);
+      Serial.print("  | Steps: ");
+      Serial.println(totalSteps);
+    }
+
+    //==Task 4 - Non-blocking LCD Refresh telemetry
+    unsigned long currentLCDTime = millis();
+    if(currentLCDTime - lastLCDTime >= lcdInterval){
+      lastLCDTime += lcdInterval;
+
+      float totalRevs = (float)totalSteps / stepsPerRev;     
+      lcd.setCursor(0,0);
+      lcd.print("Revs: ");
+      lcd.print(totalRevs);
+      lcd.print("          ");
+
+      lcd.setCursor(0,1);
+      lcd.print("Steps: ");
+      lcd.print(totalSteps);
+      lcd.print("          ");
+    }
+  }
+}
