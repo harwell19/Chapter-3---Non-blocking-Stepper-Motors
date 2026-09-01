@@ -1,0 +1,177 @@
+/*
+   Lesson 3A : Non-Blocking Continuous Stepper Engine
+   Basic stepper code architecture to a constant-infinite speed
+   Non-blocking Direction toggle switch 
+   Non-blocking Serial Telemetry
+   LEDs direction visualization
+
+   Author: Harwell Mejia
+   Tutor: GEMINI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   - 1x LCD 16x2
+   - 1x LCD driver I2C
+   - 1x Push button 
+   - 2x LEDs
+   Compiled and run in Cirkit Designer
+   simulation link:
+   https://app.cirkitdesigner.com/project/3a5d7389-0ffb-423a-b237-6f0978b1c35e
+*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define dirPin 2
+#define stepPin 3
+#define DIR_BTN 4
+#define greenPin 5
+#define redPin 6
+#define stepsPerRev 200
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//==Global Parameters==
+bool isForward = true;
+bool stepState = LOW;
+const unsigned int rpm = 60;
+long totalSteps = 0;
+
+//==Non-blocking timers
+unsigned long stepInterval;
+unsigned long lastStepTime = 0;
+
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 250;
+
+unsigned long lastLCDTime = 0;
+const unsigned long lcdInterval = 250;
+
+//==Direction switch parameters==
+bool lastDirRead = HIGH;
+bool stableDirState = HIGH;
+unsigned long dirBounceTime = 0;
+const unsigned long dirDebounceDelay = 50;
+
+void setup(){
+  Serial.begin(115200);
+  pinMode(DIR_BTN, INPUT_PULLUP);
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  lcd.begin(16,2);
+  lcd.backlight();
+
+  //Starting mode
+  stepInterval = 60000000UL / (rpm * stepsPerRev * 2.);
+
+  digitalWrite(dirPin, isForward);
+  digitalWrite(stepPin, stepState);
+
+  digitalWrite(greenPin, isForward);
+  digitalWrite(redPin, !isForward);
+
+  //Initiallating timers
+  lastStepTime = micros();
+  lastSerialTime = millis();
+  lastLCDTime = millis();
+
+  //Telemetry
+  Serial.println("Welcome to Arduino - State Machine lesson");
+  Serial.println("By Harwell Mejia");
+  Serial.print("RPM: ");
+  Serial.print(rpm);
+  Serial.print("  | Half-step pulse: ");
+  Serial.println(stepInterval);
+
+  lcd.setCursor(0,0);
+  lcd.print("Dir: ");
+  lcd.print("Clockwise");
+  lcd.setCursor(0,1);
+  lcd.print("Revs: ");
+}
+
+void loop(){
+  //==Task 1 - Activate direction toggle switch
+  bool currentDirRead = digitalRead(DIR_BTN);
+  //1.1 Detect electrical change
+  if(currentDirRead != lastDirRead){
+    lastDirRead = currentDirRead;
+    dirBounceTime = millis();
+  }
+
+  //1.2 Check bounce time
+  unsigned long currentDirTime = millis();
+  if(currentDirTime - dirBounceTime >= dirDebounceDelay){
+    bool verifiedDirRead = digitalRead(DIR_BTN);
+    
+    //1.3 Check stable state
+    if(verifiedDirRead != stableDirState){
+      stableDirState = verifiedDirRead;
+
+      //1.4 Valid button press
+      if(stableDirState == LOW){
+        isForward = !isForward; //Shift direction
+        digitalWrite(redPin, !isForward); //Visual direction detection
+        digitalWrite(greenPin, isForward);
+
+        Serial.print("Direction: "); //Telemetry
+        Serial.println(isForward? "Clockwise ":"C-Clockwise");
+        
+        if(isForward){
+          digitalWrite(dirPin, HIGH);          
+          lcd.setCursor(5,0);
+          lcd.print("Clockwise");
+          lcd.print("            ");
+        }
+        else{
+          digitalWrite(dirPin, LOW);
+          lcd.setCursor(5,0);
+          lcd.print("C-Clockwise");
+          lcd.print("            ");
+        }
+      }
+    }
+  }
+  
+  //===Task 2 - Non-blocking stepper timer
+  unsigned long currentStepTime = micros();
+  if(currentStepTime - lastStepTime >= stepInterval){
+    lastStepTime += stepInterval;
+
+    stepState = !stepState;
+    digitalWrite(stepPin, stepState);
+
+    if(stepState == HIGH){
+      totalSteps += (isForward? 1:-1);
+    }
+    
+  }
+
+  //===Task 3 - Non-blocking Serial telemetry
+  unsigned long currentSerialTime = millis();
+  if(currentSerialTime - lastSerialTime >= serialInterval){
+    lastSerialTime += serialInterval;
+
+    float totalRevs = (float)totalSteps / stepsPerRev;
+    Serial.print("Revolutions: ");
+    Serial.print(totalRevs);
+    Serial.print("  | Steps");
+    Serial.println(totalSteps);
+  }
+
+  //===Task 4 - Non-blocking LCD refresh
+  unsigned long currentLCDTime = millis();
+  if(currentLCDTime - lastLCDTime >= lcdInterval){
+    lastLCDTime += lcdInterval;
+
+    float totalRevs = (float)totalSteps / stepsPerRev;
+    lcd.setCursor(6,1);
+    lcd.print(totalRevs);
+    lcd.print("          ");
+  }
+}
