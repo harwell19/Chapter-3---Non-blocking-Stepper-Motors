@@ -1,0 +1,108 @@
+/*
+   Lesson 3B : Non-Blocking Continuous Stepper Engine
+   Features: 
+   Basic stepper code architecture to a constant speed
+   Limited number of steps 
+   Non-blocking Serial Telemetry
+
+   Author: Harwell Mejia
+   Tutor: GEMINI and Open CircuitAI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   
+   Compiled and run in Cirkit Designer
+   simulation link:
+  https://app.cirkitdesigner.com/project/b9baebe3-9d56-4add-81c9-6381577b71dc
+*/
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+
+//==Motor state parameters
+const int rpm = 60;
+bool stepState = LOW;
+const int targetStep = 2000; //Maximum distance traveled
+unsigned long currentStep = 0; //Step counting 
+bool isMotionComplete = false;
+
+//==Non-blocking stepper timing
+unsigned long stepInterval;
+unsigned long lastStepTime = 0;
+
+//==Non-blocking Serial telemetry
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 250;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+
+    //Start mode
+    stepInterval = 60000000UL / (rpm * stepsPerRev * 2UL); //Time between STEP signal transitions.
+    lastStepTime = micros();
+    lastSerialTime = millis();
+
+    digitalWrite(dirPin, HIGH);
+    digitalWrite(stepPin, LOW);
+
+    Serial.println("\nWelcome to Arduino - State Machine Serie");
+    Serial.println("By Harwell Mejia");
+    Serial.print("RPM: ");
+    Serial.print(rpm);
+    Serial.print("  | Half-step Pulse: ");
+    Serial.println(stepInterval);
+    Serial.println("Total Revolutions    |   Total Steps   ");
+}
+
+void loop(){
+    //==Task 1 - Set maximum distance traveled ==
+    if(currentStep >= targetStep && !isMotionComplete){
+        isMotionComplete = true;
+        digitalWrite(stepPin, LOW);
+
+        //Final telemetry
+        float currentRev = (float) currentStep / stepsPerRev;
+        Serial.print(currentRev, 2);
+        Serial.print("           | ");
+        Serial.println(currentStep);
+        Serial.println("---> Maximum number of steps reached  <---");
+
+    }
+
+    //==Task 2 - Execute motion when the target steps are not reached
+    if(!isMotionComplete){
+        //2.2 Non-blocking stepper motion
+        unsigned long currentStepTime = micros();
+        if(currentStepTime -lastStepTime >= stepInterval){
+            lastStepTime += stepInterval;
+
+            stepState = !stepState;
+            digitalWrite(stepPin, stepState? HIGH:LOW);
+
+            if(stepState == HIGH){
+                currentStep++;
+            }
+        }
+    }
+
+    //==Task 3- Print telemetry when the target step has not reach the maximum number of steps
+    if(!isMotionComplete){
+        //3.1 Non-blocking telemetry
+        unsigned long currentSerialTime = millis();
+        if(currentSerialTime - lastSerialTime >= serialInterval){
+            lastSerialTime += serialInterval;
+
+            float currentRev = (float) currentStep / stepsPerRev;
+            Serial.print(currentRev, 2);
+            Serial.print("          |  ");
+            Serial.println(currentStep);
+        }
+    }
+}
