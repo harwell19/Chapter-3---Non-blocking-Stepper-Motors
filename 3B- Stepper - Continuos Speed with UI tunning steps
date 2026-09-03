@@ -1,0 +1,299 @@
+/*
+   Lesson 3C : Non-Blocking Continuous Stepper Engine
+   Features: 
+   Basic stepper code architecture to a constant speed
+   Set number of steps with push buttons
+   Pausing/continue while motion
+   Non-blocking Serial Telemetry
+
+   Author: Harwell Mejia
+   Tutor: GEMINI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   - 1x LCD 16x2
+   - 1x I2C LCD Driver
+   - 4x Push Buttons
+   
+   Compiled and run in Cirkit Designer
+   simulation link:
+https://app.cirkitdesigner.com/project/9a28c595-3a6a-4d57-8a52-0358885378f7
+*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define dirPin 2
+#define stepPin 3
+#define BTN_ADDTEN 4
+#define BTN_ADDONE 5
+#define BTN_REDTEN 6
+#define BTN_START 7
+#define stepsPerRev 200
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+//==Global state parameters==
+const int rpm = 60;
+unsigned long currentStep = 0;
+unsigned long targetStep;
+bool stepState = LOW;
+bool motionStart = false;
+bool isMotionComplete = false;
+
+unsigned long setSteps = 0;
+unsigned int countTenDigits = 0;
+unsigned int reduceTen = 0;
+
+//==Motor timer parameter ==
+unsigned long lastStepTime = 0;
+unsigned long stepInterval; //Time between STEP signal transitions.
+
+//==Non-blocking LCD refresh
+unsigned long lastLCDTime = 0;
+const unsigned long lcdInterval = 250;
+
+//==Non-blocking Serial telemetry == 
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 250;
+
+//==Non-blocking steps toggle button
+//1 Adding 100
+bool lastTenRead = HIGH;
+bool stableTenState = HIGH;
+unsigned long tenBounceTime = 0;
+const unsigned long tenDebounceDelay = 50;
+
+//2. Adding 10
+bool lastOneRead = HIGH;
+bool stableOneState = HIGH;
+unsigned long oneBounceTime = 0;
+const unsigned long oneDebounceDelay = 50;
+
+//3. Substract 100 (Red = reduce)
+bool lastRedRead = HIGH;
+bool stableRedState = HIGH;
+unsigned long redBounceTime = 0;
+const unsigned long redDebounceDelay = 50;
+
+//4. Start button
+bool lastStartRead = HIGH;
+bool stableStartState = HIGH;
+unsigned long startBounceTime = 0;
+const unsigned long startDebounceDelay = 50;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(BTN_ADDTEN, INPUT_PULLUP);
+    pinMode(BTN_ADDONE, INPUT_PULLUP);
+    pinMode(BTN_REDTEN, INPUT_PULLUP);
+    pinMode(BTN_START, INPUT_PULLUP);
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+    lcd.begin(16,2);
+    lcd.backlight();
+
+    //Starting mode
+    stepInterval = 60000000UL / (rpm * stepsPerRev * 2UL);
+
+    digitalWrite(dirPin, HIGH);
+    digitalWrite(stepPin, LOW);
+
+    //Initialize timers
+    lastStepTime = micros();
+    lastLCDTime = millis();
+    lastSerialTime = millis();
+
+    //Telemetry
+    Serial.println("Welcome to Arduino - State Machine Series");
+    Serial.println("By Harwell Mejia");
+    Serial.println("Revolutions  | Steps ");
+
+    lcd.setCursor(0,0);
+    lcd.print("Set steps: ");
+    lcd.setCursor(0,1);
+}
+
+void loop(){
+    //==Task 1 - Set maximum distance traveled
+    if(motionStart && currentStep >= targetStep && !isMotionComplete){
+        isMotionComplete = true;
+        digitalWrite(stepPin, LOW);
+
+        //Final telemetry
+        float currentRev = (float) currentStep / stepsPerRev;
+        Serial.print(currentRev);
+        Serial.print("        |  ");
+        Serial.print(currentStep);
+
+        //Reset steps counting until next operation
+        currentStep = 0;
+    }
+
+    //==Task 2 - Set non blocking push button ============
+
+    //2.1. ADD 100 Toggle
+    unsigned long currentTenRead = digitalRead(BTN_ADDTEN);
+    //2.1.1 Detect electrical change
+    if(currentTenRead != lastTenRead){
+        lastTenRead = currentTenRead;
+        tenBounceTime = millis();
+    }
+    //2.1.2 Check bounce time
+    unsigned long currentTenTime = millis();
+    if(currentTenTime - tenBounceTime >= tenDebounceDelay){
+        bool verifiedTenRead = digitalRead(BTN_ADDTEN);
+        
+        //2.1.3 Check stable state
+        if(verifiedTenRead != stableTenState){
+            stableTenState = verifiedTenRead;
+            
+            //2.1.4 Verify button Press
+            if(stableTenState == LOW && !motionStart){
+                setSteps += 100;
+                lcd.setCursor(0,0);
+                lcd.print("Set steps:");
+                lcd.print(setSteps);
+                lcd.print("            "); 
+            }
+        }
+    }
+
+    //2.2. Add 10 Toggle
+    unsigned long currentOneRead = digitalRead(BTN_ADDONE);
+    //2.2.1 
+    if(currentOneRead != lastOneRead){
+        lastOneRead = currentOneRead;
+        oneBounceTime = millis();
+    }
+    //2.2.2
+    unsigned long currentOneTime = millis();
+    if(currentOneTime - oneBounceTime >= oneDebounceDelay){
+        bool verifiedOneRead = digitalRead(BTN_ADDONE);
+
+        //2.2.3
+        if(verifiedOneRead != stableOneState){
+            stableOneState = verifiedOneRead;
+
+            //2.2.4
+            if(stableOneState == LOW && !motionStart){
+                setSteps += 10;
+                lcd.setCursor(0,0);
+                lcd.print("Set steps:");
+                lcd.print(setSteps);
+                lcd.print("            ");          
+            }
+        }
+    }
+
+    //2.3. Substract 100 Toggle
+    unsigned long currentRedRead = digitalRead(BTN_REDTEN);
+    //2.3.1. 
+    if(currentRedRead != lastRedRead){
+        lastRedRead = currentRedRead;
+        redBounceTime = millis();
+    }
+
+    //2.3.2. 
+    unsigned long currentRedTime = millis();
+    if(currentRedTime - redBounceTime >= redDebounceDelay){
+        bool verifiedRedRead = digitalRead(BTN_REDTEN);
+
+        //2.3.3. 
+        if(verifiedRedRead != stableRedState){
+            stableRedState = verifiedRedRead;
+
+            //2.3.4
+            if(stableRedState == LOW && !motionStart){
+                if(setSteps >= 100){
+                    setSteps -= 100;
+                }
+                else{
+                    setSteps = countTenDigits;
+                }
+                lcd.setCursor(0,0);
+                lcd.print("Set steps:");
+                lcd.print(setSteps);
+                lcd.print("            "); 
+            }
+        }
+    }
+     //2.4. Start Button, Start motion when start button is pressed
+     unsigned long currentStartRead = digitalRead(BTN_START);
+     //2.4.1
+     if(currentStartRead != lastStartRead){
+        lastStartRead = currentStartRead;
+        startBounceTime = millis();
+     }
+
+     //2.4.2
+     unsigned long currentStartTime = millis();
+     if(currentStartTime - startBounceTime >= startDebounceDelay){
+        bool verifiedStartRead = digitalRead(BTN_START);
+
+        //2.4.3
+        if(verifiedStartRead != stableStartState){
+            stableStartState = verifiedStartRead;
+
+            //2.4.4.
+            if(stableStartState == LOW && setSteps > 0){
+                motionStart = !motionStart;
+
+                if(motionStart){
+
+                    if(isMotionComplete || currentStep == 0){
+                        targetStep = setSteps;
+                        currentStep = 0;
+                        isMotionComplete = false;
+                    }
+                    lastStepTime = micros();
+                }
+                else{
+                    digitalWrite(stepPin, LOW);
+                    stepState = LOW;
+                }
+            }
+        }
+     }
+
+     //==Task 3 - Motor motion ==
+     if(motionStart && !isMotionComplete){
+        //3.1 Non-blocking stepper motion
+        unsigned long currentStepTime = micros();
+        if(currentStepTime - lastStepTime >= stepInterval){
+            lastStepTime += stepInterval;
+
+            stepState = !stepState;
+            digitalWrite(stepPin, stepState? HIGH:LOW);
+
+            if(stepState == HIGH){
+                currentStep++;
+            }
+        }
+
+        //3.2 Non-blocking Serial telemetry
+        unsigned long currentSerialTime = millis();
+        if(currentSerialTime - lastSerialTime >= serialInterval){
+            lastSerialTime += serialInterval;
+
+            float currentRev = (float) currentStep / stepsPerRev;
+            Serial.print(currentRev);
+            Serial.print("         | ");
+            Serial.println(currentStep);
+        }
+     }
+
+     //==Task 4 - Non-blocking LCD Telemetry
+     unsigned long currentLCDTime = millis();
+     if(currentLCDTime - lastLCDTime >= lcdInterval){
+        lastLCDTime += lcdInterval;
+
+        lcd.setCursor(0,1);
+        lcd.print("Steps: ");
+        lcd.print(currentStep);
+        lcd.print("            ");
+     }
+
+}
