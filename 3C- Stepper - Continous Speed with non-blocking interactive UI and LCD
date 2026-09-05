@@ -1,0 +1,449 @@
+/*
+   Lesson 3C : Non-Blocking Continuous Stepper Engine
+   Features: 
+   Basic stepper code architecture to a constant speed
+   Set number of steps with push buttons
+   Pausing/continue while motion
+   Non-blocking Serial Telemetry
+   Non-blocking UI LCD refresh
+
+   Author: Harwell Mejia
+   Tutor: GEMINI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   - 1x LCD 16x2
+   - 1x I2C LCD Driver
+   - 7x Push Buttons
+   
+   Compiled and run in Cirkit Designer
+   simulation link:
+   https://app.cirkitdesigner.com/project/eb3516cb-012a-4b2f-84a4-cfacec813ff6
+   
+*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define dirPin 2
+#define stepPin 3
+#define BTN_1 4     //Adding 100 mm
+#define BTN_2 5     //Adding 10 mm
+#define BTN_3 6     //Adding 1 mm
+#define BTN_4 7     //Substract 100 mm
+#define BTN_5 8     //Substract 10 mm
+#define BTN_6 9     //Substract 1 mm
+#define BTN_START 10//Start / Pause button
+#define stepsPerRev 200
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//== Global motion state parameters ==
+const int rpm = 60;
+bool stepState = LOW;
+bool isMotionComplete = false;
+bool motionStart = false;
+bool isForward = true;     //Clockwise direction
+
+unsigned long currentDistance = 0;
+const int beltPitch = 2;    //GT2 Belt 2mm
+const int pulleyTheet = 20; //GT2 Pulley teeth number 20
+long distancePerRev;   // Pitch x theets in 1 rev  --> mm/rev
+float stepsPerDistance; //stepsPerRev / distancePerRev --> steps/mm
+long targetSteps;   //stepsPerDis x targetDistance --> steps
+long targetDistance; //distance in mm
+long setDistance = 0;     // Set positive and negative distance
+
+unsigned long currentStep = 0;
+
+//==Non-blocking stepper variables
+unsigned long lastStepTime = 0;
+unsigned long stepInterval;
+
+//==Non-blocking Serial telemetry variables==
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 150;
+
+//==Non-blocking LCD refresh telemetry variables
+unsigned long lastLCDTime = 0;
+const unsigned long lcdInterval = 250;
+
+//==Non-blocking toggle variables==
+// Button 1
+bool lastBTN1Read = HIGH;
+bool stableBTN1State = HIGH;
+unsigned long btn1BounceTime = 0;
+const unsigned long btn1DebounceDelay = 50;
+// Button 2
+bool lastBTN2Read = HIGH;
+bool stableBTN2State = HIGH;
+unsigned long btn2BounceTime = 0;
+const unsigned long btn2DebounceDelay = 50;
+// Button 3
+bool lastBTN3Read = HIGH;
+bool stableBTN3State = HIGH;
+unsigned long btn3BounceTime = 0;
+const unsigned long btn3DebounceDelay = 50;
+// Button 4
+bool lastBTN4Read = HIGH;
+bool stableBTN4State = HIGH;
+unsigned long btn4BounceTime = 0;
+const unsigned long btn4DebounceDelay = 50;
+// Button 5
+bool lastBTN5Read = HIGH;
+bool stableBTN5State = HIGH;
+unsigned long btn5BounceTime = 0;
+const unsigned long btn5DebounceDelay = 50;
+// Button 6
+bool lastBTN6Read = HIGH;
+bool stableBTN6State = HIGH;
+unsigned long btn6BounceTime = 0;
+const unsigned long btn6DebounceDelay = 50;
+// Button start
+bool lastStartRead = HIGH;
+bool stableStartState = HIGH;
+unsigned long startBounceTime = 0;
+const unsigned long startDebounceDelay = 50;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(BTN_1, INPUT_PULLUP);
+    pinMode(BTN_2, INPUT_PULLUP);
+    pinMode(BTN_3, INPUT_PULLUP);
+    pinMode(BTN_4, INPUT_PULLUP);
+    pinMode(BTN_5, INPUT_PULLUP);
+    pinMode(BTN_6, INPUT_PULLUP);
+    pinMode(BTN_START, INPUT_PULLUP);
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+    lcd.begin(16,2);
+    lcd.backlight();
+
+    //Initiallization
+    //GT2 BELT - PULLEY System (2mm pitch ~ 20 theet)
+    distancePerRev = beltPitch * pulleyTheet;
+    stepsPerDistance = (float)stepsPerRev / distancePerRev;
+    targetSteps = labs(stepsPerDistance) * targetDistance;
+
+    stepInterval = 60000000UL / (rpm * stepsPerRev * 2UL);
+
+    //Stepper begin
+    digitalWrite(dirPin, isForward);
+    digitalWrite(stepPin, LOW);
+
+    //Non-blocking timer start
+    lastStepTime = micros();
+    lastSerialTime = millis();
+
+    //Telemetry
+    Serial.println("\nWelcome to Arduino - State Machine Series");
+    Serial.println("By Harwell Mejia");
+    Serial.print("Distance: ");
+    Serial.print(targetDistance);
+    Serial.print("  | Max Steps: ");
+    Serial.print(targetSteps);
+    Serial.print("  | Half-step pulse: ");
+    Serial.println(stepInterval);
+    Serial.println("Distance Traveled | Revolutions ");
+
+    lcd.setCursor(0,0);
+    lcd.print("Set X: ");
+    lcd.print("0.00 mm");
+}
+
+void loop(){
+    //==TASK 1 - Set target distance==
+    if(motionStart && !isMotionComplete && currentStep >= targetSteps){
+        isMotionComplete = true;
+        motionStart = false;
+        digitalWrite(stepPin, LOW);
+        //Telemetry
+        Serial.println(setDistance);
+        Serial.print("-->Target distance reached <--");
+
+        lcd.setCursor(0,1);
+        lcd.print("X: ");
+        lcd.print(setDistance);
+        lcd.print(" mm             ");
+    }
+
+    /*=====================================================================
+              TASK 2 - NON-BLOCKING TOGGLE BUTTONS
+    =======================================================================*/
+    //2.0 Button 0 = Start / Pause Button
+    //2.0.1. Reading electrical signal
+    bool currentStartRead = digitalRead(BTN_START);
+    //2.0.2. Detect electrical change
+    if(currentStartRead != lastStartRead){
+        lastStartRead = currentStartRead;
+        startBounceTime = millis();
+    }
+    //2.0.3. Check bounce time
+    unsigned long currentStartTime = millis();
+    if(currentStartTime - startBounceTime >= startDebounceDelay){
+        bool verifiedStartRead = digitalRead(BTN_START);
+        //2.0.4 Verify stable state
+        if(verifiedStartRead != stableStartState){
+            stableStartState = verifiedStartRead;
+            //2.0.5. Valid button pressing
+            if(stableStartState == LOW && setDistance != 0){
+               motionStart = !motionStart;
+               
+               if(motionStart){
+                
+                if(isMotionComplete || currentStep == 0){
+                    targetDistance = setDistance;
+                    targetSteps = labs(targetDistance) * stepsPerDistance;
+                    currentDistance = 0;
+                    isMotionComplete = false;
+                }
+                 lastStepTime = micros();
+               }             
+               else{
+                digitalWrite(stepPin, LOW);
+                stepState = LOW;
+               }
+            }
+        }
+    }
+    //=====================================================================
+
+    //2.1 Button 1 = Add 100 mm
+    //2.1.1. Reading electrical signal
+    bool currentBTN1Read = digitalRead(BTN_1);
+    //2.1.2. Detect electrical change
+    if(currentBTN1Read != lastBTN1Read){
+        lastBTN1Read = currentBTN1Read;
+        btn1BounceTime = millis();
+    }
+    //2.1.3. Check bounce time
+    unsigned long currentBTN1Time = millis();
+    if(currentBTN1Time - btn1BounceTime >= btn1DebounceDelay){
+        bool verifiedBTN1Read = digitalRead(BTN_1);
+        //2.1.4 Verify stable state
+        if(verifiedBTN1Read != stableBTN1State){
+            stableBTN1State = verifiedBTN1Read;
+            //2.1.5. Valid button pressing
+            if(stableBTN1State == LOW && !motionStart){
+                setDistance += 100;
+                if(setDistance > 0){
+                    isForward = true;
+                }
+                else{
+                    isForward = false;
+                }
+
+                lcd.setCursor(0,0);
+                lcd.print("Set X: ");
+                lcd.print(setDistance);
+                lcd.print(" mm            ");
+            }
+        }
+    }
+
+    //=====================================================================
+    //2.2. Button 2 - ADD 10 mm
+    //2.2.1. Detect electrical signal
+    unsigned long currentBTN2Read = digitalRead(BTN_2);
+    //2.2.2. Detect electrical change
+    if(currentBTN2Read != lastBTN2Read){
+        lastBTN2Read = currentBTN2Read;
+        btn2BounceTime = millis();
+    }
+    //2.2.3. Check Bounce Time
+    unsigned long currentBTN2Time = millis();
+    if(currentBTN2Time - btn2BounceTime >= btn2DebounceDelay){
+        bool verifiedBTN2Read = digitalRead(BTN_2);
+        //2.2.4. Check stable state
+        if(verifiedBTN2Read != stableBTN2State){
+            stableBTN2State = verifiedBTN2Read;
+            //2.2.5. Valid button Press
+            if(stableBTN2State == LOW && !motionStart){
+                setDistance += 10;
+                if(setDistance > 0){
+                    isForward = true;
+                }
+                else{
+                    isForward = false;
+                }
+                
+                lcd.setCursor(0,0);
+                lcd.print("Set X: ");
+                lcd.print(setDistance);
+                lcd.print(" mm            ");
+            }
+        }
+    } 
+    //=======================================================================
+    //2.3 Button 3 - Add 1
+    unsigned long currentBTN3Read = digitalRead(BTN_3);
+    if(currentBTN3Read != lastBTN3Read){
+        lastBTN3Read = currentBTN3Read;
+        btn3BounceTime = millis();
+    }
+    unsigned long currentBTN3Time = millis();
+    if(currentBTN3Time - btn3BounceTime>= btn3DebounceDelay){
+        bool verifiedBTN3Read = digitalRead(BTN_3);
+        if(verifiedBTN3Read != stableBTN3State){
+            stableBTN3State = verifiedBTN3Read;
+            if(stableBTN3State == LOW && !motionStart){
+            setDistance++;
+            if(setDistance > 0){
+                    isForward = true;
+                }
+                else{
+                    isForward = false;
+                }
+
+                lcd.setCursor(0,0);
+                lcd.print("Set X: ");
+                lcd.print(setDistance);
+                lcd.print(" mm            ");
+            }
+        }
+    }
+
+    //=======================================================================
+    //2.4 Button 4 - Substract 100
+    unsigned long currentBTN4Read = digitalRead(BTN_4);
+    if(currentBTN4Read != lastBTN4Read){
+        lastBTN4Read = currentBTN4Read;
+        btn4BounceTime = millis();
+    }
+    unsigned long currentBTN4Time = millis();
+    if(currentBTN4Time - btn4BounceTime >= btn4DebounceDelay){
+        bool verifiedBTN4Read = digitalRead(BTN_4);
+        if(verifiedBTN4Read != stableBTN4State){
+            stableBTN4State = verifiedBTN4Read;
+            if(stableBTN4State == LOW && !motionStart){
+            setDistance -= 100;
+            if(setDistance > 0){
+                    isForward = true;
+                }
+                else{
+                    isForward = false;
+                }
+
+                lcd.setCursor(0,0);
+                lcd.print("Set X: ");
+                lcd.print(setDistance);
+                lcd.print(" mm            ");
+            }
+        }
+    }
+
+    //=======================================================================
+    //2.5 Button 5 - Substract 10
+    unsigned long currentBTN5Read = digitalRead(BTN_5);
+    if(currentBTN5Read != lastBTN5Read){
+        lastBTN5Read = currentBTN5Read;
+        btn5BounceTime = millis();
+    }
+    unsigned long currentBTN5Time = millis();
+    if(currentBTN5Time - btn5BounceTime >= btn5DebounceDelay){
+        bool verifiedBTN5Read = digitalRead(BTN_5);
+        if(verifiedBTN5Read != stableBTN5State){
+            stableBTN5State = verifiedBTN5Read;
+            if(stableBTN5State == LOW && !motionStart){
+            setDistance -= 10;
+            if(setDistance > 0){
+                    isForward = true;
+                }
+                else{
+                    isForward = false;
+                }
+
+                lcd.setCursor(0,0);
+                lcd.print("Set X: ");
+                lcd.print(setDistance);
+                lcd.print(" mm            ");
+            }
+        }
+    }
+
+    //=======================================================================
+    //2.6 Button 6 - Substract 1
+    unsigned long currentBTN6Read = digitalRead(BTN_6);
+    if(currentBTN6Read != lastBTN6Read){
+        lastBTN6Read = currentBTN6Read;
+        btn6BounceTime = millis();
+    }
+    unsigned long currentBTN6Time = millis();
+    if(currentBTN6Time - btn6BounceTime >= btn6DebounceDelay){
+        bool verifiedBTN6Read = digitalRead(BTN_6);
+        if(verifiedBTN6Read != stableBTN6State){
+            stableBTN6State = verifiedBTN6Read;
+            if(stableBTN6State == LOW && !motionStart){
+            setDistance -= 1;
+            if(setDistance > 0){
+                    isForward = true;
+                }
+                else{
+                    isForward = false;
+                }
+
+                lcd.setCursor(0,0);
+                lcd.print("Set X: ");
+                lcd.print(setDistance);
+                lcd.print(" mm            ");
+            }
+        }
+    }
+
+    /*=======================================================================
+
+                         End of push button coding
+  
+    =========================================================================*/
+
+    //==Task 3 - Non-blocking motion
+    if(motionStart && !isMotionComplete){
+        unsigned long currentStepTime = micros();
+        if(currentStepTime - lastStepTime >= stepInterval){
+            lastStepTime += stepInterval;
+            stepState = !stepState;
+            digitalWrite(stepPin, stepState? HIGH:LOW);
+            if(stepState == HIGH){
+                currentStep++;
+            }
+
+            if(isForward){
+                digitalWrite(dirPin, HIGH); // Motor spins in Clockwise direction
+            }
+            else if(!isForward){
+                digitalWrite(dirPin, LOW); // Motor spins in C-Clockwise direction
+            }
+        }
+    }
+
+
+    //======================================================================
+
+    //==Task 4 - Non-blocking Serial Telemetry
+    unsigned long currentSerialTime = millis();
+    if(currentSerialTime - lastSerialTime >= serialInterval){
+        lastSerialTime += serialInterval;
+
+        float currentDistance = ((float) currentStep / stepsPerDistance) * (isForward? 1:-1);
+        float currentRev = (float) currentStep / stepsPerRev;
+        Serial.print(currentDistance);
+        Serial.print("mm   |  ");
+        Serial.print(currentRev);
+        Serial.println("Revolutions");
+    }
+
+    //==Task 4 - Non-blocking LCD Refresh telemetry
+    unsigned long currentLCDTime = millis();
+    if(currentLCDTime - lastLCDTime >= lcdInterval){
+        lastLCDTime += lcdInterval;
+
+        float currentDistance = ((float) currentStep / stepsPerDistance) * (isForward? 1:-1);
+        lcd.setCursor(0,1);
+        lcd.print("X: ");
+        lcd.print(currentDistance);
+        lcd.print(" mm             ");
+    }
+}
