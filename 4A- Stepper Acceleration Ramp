@@ -1,0 +1,137 @@
+/*
+   Lesson 4A : Non-Blocking Acceleration ramp Stepper Engine
+   Features: 
+   Acceleration ramp code architecture from low speed to cruise speed
+   Limited number of steps 
+   Non-blocking Serial Telemetry
+
+   Author: Harwell Mejia
+   Tutor: GEMINI and Open CircuitAI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Date:
+   - 2026/09/08
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   
+   Compiled and run in Cirkit Designer
+   simulation link:
+   https://app.cirkitdesigner.com/project/144a4829-ef60-4040-8e49-4e46fcb8071d
+*/
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+
+//==Motion state==
+bool stepState = LOW;
+unsigned long currentStep = 0;
+bool targetPrinted = false;
+
+//==Motion parameters and variables
+const unsigned int Acceleration = 24;     //in uS/steps^2
+unsigned long accelSteps;     //Number of steps need to accelerate to cruise Speed
+const int initialSpeed = 5; //In RPM
+const int cruiseSpeed = 120; //Maximum speed in RPM
+unsigned long initInterval; //in uS/steps (the bigger number, the slower speed)
+unsigned long cruiseInterval;
+
+const unsigned long targetStep = 2000; //Max distance traveled in STEPS
+
+//==Non-blocking Stepper motion parameters
+unsigned long lastStepTime = 0;
+unsigned long stepInterval;
+
+//==Non-blocking Serial Telemetry parameters
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 150;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+
+    //Initial state
+    initInterval = 60000000UL / (initialSpeed * stepsPerRev * 2UL);
+    cruiseInterval = 60000000UL / (cruiseSpeed * stepsPerRev * 2UL);
+    stepInterval = initInterval;
+
+    //========================================================
+    //Acceleration = initInterval / cruiseInterval;
+    accelSteps = (initInterval - cruiseInterval) / Acceleration;
+
+    //Safety check: for short distance, reduce the acceleration ramp
+    if(accelSteps > targetStep){
+        accelSteps = targetStep;
+    }
+    //==========================================================
+    lastStepTime = micros();
+    lastSerialTime = millis();
+
+    digitalWrite(dirPin, HIGH);
+    digitalWrite(stepPin, LOW);
+
+    //Telemetry
+    Serial.println("\nWelcome to Arduino - State Machine Series **Stepper Motors**");
+    Serial.println("By Harwell Mejia");
+    Serial.print("Max distance: ");
+    Serial.print(targetStep);
+    Serial.print(" | ");
+    Serial.print("Acceleration: ");
+    Serial.println(Acceleration);
+    Serial.println("RPM  |   STEPS");
+}
+
+void loop(){
+    //Define max distance
+    if(currentStep >= targetStep){
+        digitalWrite(stepPin, LOW);
+
+        if(!targetPrinted){
+            Serial.println("--> Target steps reached <--");
+            targetPrinted = true;
+        }
+        return;
+    }
+
+    //== Start motion ==
+    //== Non- blocking stepper
+    unsigned long currentStepTime = micros();
+    if(currentStepTime - lastStepTime >= stepInterval){
+        lastStepTime += stepInterval;
+        stepState = !stepState;
+        digitalWrite(stepPin, stepState? HIGH:LOW);
+
+        //Counting steps
+        if(stepState == HIGH){
+            currentStep++;
+
+            if(currentStep < accelSteps){
+                if(stepInterval > cruiseInterval + Acceleration){
+                    stepInterval -= Acceleration;
+                }
+                else{
+                    stepInterval = cruiseInterval;
+                }
+            }
+            else {
+                stepInterval = cruiseInterval;
+            }
+        }
+    }
+
+    //Non-blocking telemetry
+    unsigned long currentSerialTime = millis();
+    if(currentSerialTime - lastSerialTime >= serialInterval){
+        lastSerialTime += serialInterval;
+
+        float currentSpeed = 60000000.0f / ((float)stepInterval * stepsPerRev * 2.0f);
+        Serial.print(currentSpeed,1);
+        Serial.print(" | ");
+        Serial.println(currentStep);
+    }
+}
