@@ -1,0 +1,154 @@
+/*
+   Lesson 4B : Non-Blocking Acceleration ramp Stepper Engine
+   Features: 
+   Acceleration ramp code architecture from low speed to cruise speed
+   Set limit distance traveled in mm
+   Non-blocking Serial Telemetry
+
+   Author: Harwell Mejia
+   Tutor: GEMINI and Open CircuitAI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Date:
+   - 2026/09/09
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   
+   Compiled and run in Cirkit Designer
+*/
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+
+//==Global state variables
+bool stepState = LOW;
+bool targetReached = false;
+unsigned long targetStep;
+unsigned long currentStep = 0;
+
+//==GTE BLT and distance parameters
+unsigned long targetDistance = 1000; //Distance in mm
+const int beltPitch = 2;
+const int theetCount = 20;
+unsigned int distPerRev; // How long it travel per revolution
+float stepsPerDistance; //How many steps per mm
+
+//==Motion state parameters
+unsigned int Acceleration = 40;
+unsigned long accelStep;
+unsigned int initialSpeed = 5;
+unsigned int cruiseSpeed = 120;
+
+unsigned long initialInterval;
+unsigned long cruiseInterval;
+
+//==Non-blocking stepper==
+unsigned long stepInterval;
+unsigned long lastStepTime = 0;
+
+//==Non-blocking Serial Telemetry
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 150;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+
+    //Initial state
+    initialInterval = 60000000UL / (initialSpeed * stepsPerRev * 2UL);
+    cruiseInterval = 60000000UL / (cruiseSpeed * stepsPerRev * 2UL);
+    stepInterval = initialInterval;
+
+    accelStep = (initialInterval - cruiseInterval) / Acceleration;
+
+    digitalWrite(dirPin, HIGH);
+    digitalWrite(stepPin, LOW);
+
+    lastStepTime = micros();
+    lastSerialTime = millis();
+
+    //Belt motion calculation
+    distPerRev = (float) (beltPitch * theetCount);           // 2mm * 20/Rev = 40 mm/Rev
+    stepsPerDistance = (float)stepsPerRev / (float)distPerRev;  // 200 steps/Rev / 40mm/Rev = 5 steps/mm
+
+    targetStep = (unsigned long)(targetDistance * stepsPerDistance); //x mm * 5 steps/mm = xx steps
+
+     //========================================
+    /*==Safety guard for short distance 
+        to avoid truncated acceleration ramp */
+    
+    if(accelStep > targetStep){
+        accelStep = targetStep;
+    }
+    //========================================*/
+
+    //Telemetry
+    Serial.println("\nWelcome to Arduino - State Machine **Stepper** Series");
+    Serial.println("By Harwell Mejia");
+    Serial.print("Max distance: ");
+    Serial.print(targetDistance);
+    Serial.print("| Max steps: ");
+    Serial.println(targetStep);
+
+    Serial.println("RPM  |  Distance  |  Steps ");
+}
+
+void loop(){
+    //==Task 1- Declaring motion limits
+    if(currentStep >= targetStep){
+        stepState = LOW;
+        digitalWrite(stepPin, stepState);
+        if(!targetReached){
+            Serial.println("--> Target reached <--");
+            targetReached = true;
+        }
+        return;
+    }
+
+    //Task 2 - Non-blocking stepper motion
+    unsigned long currentStepTime = micros();
+    if(currentStepTime - lastStepTime >= stepInterval){
+        lastStepTime += stepInterval;
+        stepState = !stepState;
+        digitalWrite(stepPin, stepState? HIGH:LOW);
+        
+        //Counting steps to set distance limit
+        if(stepState == HIGH){
+            currentStep++;
+
+            //Acceleration Ramp
+            if(currentStep < accelStep){
+                if(stepInterval > cruiseInterval + Acceleration){
+                    stepInterval -= Acceleration;
+                }
+                else{
+                    stepInterval = cruiseInterval;
+                }
+            }
+            //Cruise speed
+            else if(currentStep >= accelStep){
+                stepInterval = cruiseInterval;
+            }
+        }
+    }
+
+    //==Non-blocking Serial telemetry
+    unsigned long currentSerialTime = millis();
+    if(currentSerialTime - lastSerialTime >= serialInterval){
+        lastSerialTime += serialInterval;
+
+        float currentSpeed = 60000000.0f / ((float)stepInterval * stepsPerRev * 2.0f);
+        float currentDistance = (float)currentStep / stepsPerDistance;
+        Serial.print(currentSpeed,2);
+        Serial.print(" | ");
+        Serial.print(currentDistance);
+        Serial.print(" | ");
+        Serial.println(currentStep);
+    }
+}
