@@ -1,0 +1,152 @@
+/*
+   Lesson 5 : Stepper - Trapezoidal Speed profile **Core code Structure**
+   Features: 
+   Non-blocking acceleration-> Cruise Speed -> Deceleration ramp (Trapezoidal Speed profile)
+   Triangle speed profile as Safe guard for short distances traveled
+   Distance limited by number of steps 
+   Non-blocking Serial Telemetry
+
+   Author: Harwell Mejia
+   Tutor: GEMINI
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Date:
+   - 2026/09/14
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   
+   Compiled and run in Cirkit Designer
+*/
+
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+
+//== Global State parameters ==
+bool isForward = true; //Spin in Clockwise direction
+bool stepState = LOW;
+bool motionComplete = false;  
+
+//== Motion State variables
+const unsigned int initialSpeed = 5;   //Speed units [RPM]
+const unsigned int cruiseSpeed = 120;
+unsigned long initialInterval; //Interval units in [uS/Steps]
+unsigned long cruiseInterval;
+
+int targetStep = 2500; //Units [Steps]
+long currentStep = 0; //steps counter
+
+unsigned int Acceleration = 30;  // Units [us/Steps^2]
+unsigned long accelStep;         // Distance required to accelerate from min speed to cruise speed
+unsigned long decelStep;        // Distance required to brake 
+
+//==Non-blocking Stepper motion parameters ==
+unsigned long lastStepTime = 0; //units [microseconds - uS]
+unsigned long stepInterval;
+
+//==Non-blocking Serial telemetry==
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 150;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(stepPin, OUTPUT);
+    pinMode(dirPin, OUTPUT);
+
+    //Initial state
+    digitalWrite(dirPin, HIGH);
+    digitalWrite(stepPin, LOW);
+
+    initialInterval = 60000000UL / (initialSpeed * stepsPerRev * 2UL);
+    cruiseInterval = 60000000UL / (cruiseSpeed * stepsPerRev * 2UL);
+    stepInterval = initialInterval;
+
+    accelStep = (initialInterval - cruiseInterval) / Acceleration;
+    decelStep = targetStep - accelStep;
+
+    lastStepTime = micros();
+    lastSerialTime = millis();
+
+    //----Safety guard for short traveled distance-------
+    if(accelStep > targetStep / 2.){
+        accelStep = targetStep / 2.;
+        decelStep = accelStep;
+    }
+
+    // Set direction depending on the target distance orientation
+    if(targetStep > 0){
+        isForward = true;
+        digitalWrite(dirPin, isForward);
+    }
+    else{
+        isForward = false;
+        digitalWrite(dirPin, isForward);
+    }
+    //Telemetry
+    Serial.println("Welcome to Arduino - State machine **Stepper** Series");
+    Serial.println("By Harwell Mejia");
+    Serial.print("Step Interval: ");
+    Serial.print(stepInterval);
+    Serial.print(" | Max number of steps: ");
+    Serial.println(targetStep);
+}
+
+void loop(){
+    //Task 1 - Stop when reache max distance
+    if(currentStep >= abs (targetStep)){
+        stepState = LOW;
+        digitalWrite(stepPin, stepState);
+        if(!motionComplete){
+            Serial.print("Max. distance reached ** ");
+            Serial.print(targetStep);
+            Serial.println(" Steps**");
+            motionComplete = true;
+        }
+        return;
+    }
+
+    //==Task 2 - Non-blocking Stepper motion 
+    unsigned long currentStepTime = micros();
+    if(currentStepTime - lastStepTime >= stepInterval){
+        lastStepTime += stepInterval;
+        stepState = !stepState;
+        digitalWrite(stepPin, stepState? HIGH:LOW);
+
+        if(stepState == HIGH){
+            currentStep++;
+
+            // Trapezoidal speed profile
+            if(currentStep < accelStep){
+                if(initialInterval > cruiseInterval){
+                    stepInterval -= Acceleration;
+                }
+                else{
+                    stepInterval = cruiseInterval;
+                }
+            }
+            else if(currentStep >= accelStep && currentStep < decelStep){
+                stepInterval = cruiseInterval;
+            }
+            else if(currentStep >= decelStep){
+                stepInterval += Acceleration;
+            }
+        }
+    }
+
+    //==Task 3 - Non-blocking telemetry
+    unsigned long currentSerialTime = millis();
+    if(currentSerialTime - lastSerialTime >= serialInterval){
+        lastSerialTime += serialInterval;
+
+        float currentSpeed = 60000000.0f / (stepInterval * stepsPerRev * 2.0f);
+        Serial.print("RPM: ");
+        Serial.print(currentSpeed);
+        Serial.print(" | Steps: ");
+        Serial.println(currentStep);
+    }
+}
