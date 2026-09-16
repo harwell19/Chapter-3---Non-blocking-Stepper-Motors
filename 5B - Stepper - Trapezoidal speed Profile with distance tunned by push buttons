@@ -1,0 +1,474 @@
+/*
+   Lesson 5 : Stepper - Trapezoidal speed profile with distance tunned by push buttons
+
+   Features: 
+   Non-blocking acceleration-> Cruise Speed -> Deceleration ramp (Trapezoidal Speed profile)
+   Triangle speed profile as Safe guard for short distances traveled
+   Distance tunned by push buttons
+   Non-blocking telemetry
+   Start/Pause toggle switch 
+
+   Author: Harwell Mejia
+
+   Tutor: GEMINI 
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Date:
+   - 2026/09/16
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   - 1x LCD 16x2 
+   - 1x I2C lcd driver
+   - 7x push buttons
+   
+   Compiled and run in Cirkit Designer
+   Simulation link:
+   https://app.cirkitdesigner.com/project/29a8d16c-4279-4230-a204-0d3b97984386
+*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define dirPin 2
+#define stepPin 3
+#define stepsPerRev 200
+#define BTN_PIN1 4
+#define BTN_PIN2 5
+#define BTN_PIN3 6
+#define BTN_PIN4 7
+#define BTN_PIN5 8
+#define BTN_PIN6 9
+#define BTN_PIN7 10
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//Global motion state parameters
+bool stepState = false;
+bool isForward = true; // clockwise direction
+bool motionStart = false;
+bool MotionComplete = false;
+
+unsigned long targetStep;   // from maximum distance traveled in [Steps]
+unsigned long currentStep = 0; //step counter
+long targetDistance;  //Distance in mm
+
+//Stepper motion state parameters
+const int Acceleration = 30;    // Units [uS/steps^2]
+unsigned long initialSpeed = 5; // units [RPM]
+unsigned long cruiseSpeed = 120;
+unsigned long initialInterval;   //Half-step pulse in [uS/Steps]
+unsigned long cruiseInterval;
+
+unsigned long accelStep; //Acceleration ramp distance
+unsigned long decelStep;
+
+//Belt parameters (for GT2 Belt)
+const int beltPitch = 2; //P [mm]
+const int theetNumber = 20; // Z theet number per rev [(theet)*1 /Rev]
+float distancePerRev; //DR = P * Z [mm/Rev]
+float stepDistance; //SD = SPR/DR [Steps/mm]
+
+//Non-blocking stepper timer
+unsigned long lastStepTime = 0;
+unsigned long stepInterval;
+
+//Non-blocking Serial print Telemetry
+unsigned long lastSerialTime = 0;
+const unsigned long serialInterval = 250;
+
+//Non-blocking LCD rfresh telemetry
+unsigned long lastLCDTime = 0;
+const unsigned long lcdInterval = 150;
+
+//Non-blocking Toggle buttons
+//Button 1 - Add 100 mm
+bool lastBTN1Read = HIGH;
+bool stableBTN1 = HIGH;
+unsigned long btn1BounceTime = 0;
+
+//Button 2 - Add 10 mm
+bool lastBTN2Read = HIGH;
+bool stableBTN2 = HIGH;
+unsigned long btn2BounceTime = 0;
+
+//Button 3 - Add 1 mm
+bool lastBTN3Read = HIGH;
+bool stableBTN3 = HIGH;
+unsigned long btn3BounceTime = 0;
+
+//Button 4 - Subtract 100 mm
+bool lastBTN4Read = HIGH;
+bool stableBTN4 = HIGH;
+unsigned long btn4BounceTime = 0;
+
+//Button 5 - Subtract 10 mm
+bool lastBTN5Read = HIGH;
+bool stableBTN5 = HIGH;
+unsigned long btn5BounceTime = 0;
+
+//Button 6 - Subtract 1 mm
+bool lastBTN6Read = HIGH;
+bool stableBTN6 = HIGH;
+unsigned long btn6BounceTime = 0;
+
+//Button 7 - Start / Pause
+bool lastStartRead = HIGH;
+bool stableStart = HIGH;
+unsigned long startBounceTime = 0;
+
+const unsigned long DebounceDelay = 50;  //Debounce time for all push buttons
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(BTN_PIN1, INPUT_PULLUP);
+    pinMode(BTN_PIN2, INPUT_PULLUP);
+    pinMode(BTN_PIN3, INPUT_PULLUP);
+    pinMode(BTN_PIN4, INPUT_PULLUP);
+    pinMode(BTN_PIN5, INPUT_PULLUP);
+    pinMode(BTN_PIN6, INPUT_PULLUP);
+    pinMode(BTN_PIN7, INPUT_PULLUP);
+    pinMode(dirPin, OUTPUT);
+    pinMode(stepPin, OUTPUT);
+    lcd.begin(16,2);
+    lcd.backlight();
+
+    //=== Initial state===
+    //Initiate timer
+    lastStepTime = micros();
+    lastSerialTime = millis();
+    lastLCDTime = millis();
+
+    //Interval calculation
+    initialInterval = 60000000UL / (initialSpeed * stepsPerRev * 2UL);
+    cruiseInterval = 60000000UL / (cruiseSpeed * stepsPerRev * 2UL);
+    stepInterval = initialInterval;
+    
+    //Distance calculation
+    distancePerRev = beltPitch * theetNumber;
+    stepDistance = stepsPerRev / distancePerRev;
+    targetStep = (unsigned long) (stepDistance * abs(targetDistance));
+
+    //Acceleration ramp
+    accelStep = (initialInterval - cruiseInterval) / Acceleration;
+    decelStep = accelStep;
+
+    //Safe guard for short distance
+    //Avoid truncated trapezoidal shape - Convert it in triangular profile
+    unsigned long accelStepCal = (initialInterval - cruiseInterval) / Acceleration;
+    accelStep = (accelStepCal >= targetStep / 2.)? targetStep / 2. : accelStepCal;
+    decelStep = targetStep - accelStep;
+
+    //Set direction of rotation for +X or -X
+    if(targetDistance > 0){
+        isForward = true;
+        digitalWrite(dirPin, isForward);
+    }
+    else{
+        isForward = false;
+        digitalWrite(dirPin, LOW);
+    }
+
+    //Telemetry
+    Serial.println("\nWelcome to Arduino - State Machine *STEPPER* Series");
+    Serial.println("By Harwell Mejia");
+    Serial.println(" RPM |   Steps   |  Revs  | Distance ");
+
+    lcd.setCursor(0,0);
+    lcd.print("Set D: 0.0 mm");
+    lcd.setCursor(0,1);
+    lcd.print("Dist: 0 mm");
+}
+
+void loop(){
+    /*======================================================
+         TASK 1 - NON-BLOCKING TOGGLE BUTTONS
+    ========================================================*/
+    //1.1. Button 1  +100mm
+    //1.1.1 Read electrical signal
+    bool BTN1_Read = digitalRead(BTN_PIN1);
+    //1.1.2 Detect electrical Change
+    if(BTN1_Read != lastBTN1Read){
+        lastBTN1Read = BTN1_Read;
+        btn1BounceTime = millis();
+    }
+    //1.1.3 Check bounce time
+    if(millis() - btn1BounceTime >= DebounceDelay){
+        bool verifiedBTN1Read = digitalRead(BTN_PIN1);
+        //1.1.4 Verify stable state
+        if(verifiedBTN1Read != stableBTN1){
+            stableBTN1 = verifiedBTN1Read;
+            //1.1.5 Valid button pressing
+            if(stableBTN1 == LOW && !motionStart){
+                targetDistance += 100;
+                //LCD Telemetry
+                lcd.setCursor(0,0);
+                lcd.print("Set D: ");
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("              ");
+            }
+        }
+    }
+    //=====================================================
+    //1.2. Button 2  +10mm
+    //1.2.2 Read electrical signal
+    bool BTN2_Read = digitalRead(BTN_PIN2);
+    //1.2.2 Detect electrical Change
+    if(BTN2_Read != lastBTN2Read){
+        lastBTN2Read = BTN2_Read;
+        btn2BounceTime = millis();
+    }
+    //1.2.3 Check bounce time
+    if(millis() - btn2BounceTime >= DebounceDelay){
+        bool verifiedBTN2Read = digitalRead(BTN_PIN2);
+        //1.2.4 Verify stable state
+        if(verifiedBTN2Read != stableBTN2){
+            stableBTN2 = verifiedBTN2Read;
+            //1.2.5 Valid button pressing
+            if(stableBTN2 == LOW && !motionStart){
+                targetDistance += 10;
+                //LCD Telemetry
+                lcd.setCursor(0,0);
+                lcd.print("Set D: ");;
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("              ");
+            }
+        }
+    }
+    //=====================================================
+    //1.3.1 Button 3  +1mm
+    //1.3.2 Read electrical signal
+    bool BTN3_Read = digitalRead(BTN_PIN3);
+    //1.3.2 Detect electrical Change
+    if(BTN3_Read != lastBTN3Read){
+        lastBTN3Read = BTN3_Read;
+        btn3BounceTime = millis();
+    }
+    //1.3.3 Check bounce time
+    if(millis() - btn3BounceTime >= DebounceDelay){
+        bool verifiedBTN3Read = digitalRead(BTN_PIN3);
+        //1.3.4 Verify stable state
+        if(verifiedBTN3Read != stableBTN3){
+            stableBTN3 = verifiedBTN3Read;
+            //1.3.5 Valid button pressing
+            if(stableBTN3 == LOW && !motionStart){
+                targetDistance++;
+                //LCD Telemetry
+                lcd.setCursor(0,0);
+                lcd.print("Set D: ");
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("              ");
+            }
+        }
+    }
+    //=====================================================
+    //1.4.1 Button 4  -100mm
+    //1.4.2 Read electrical signal
+    bool BTN4_Read = digitalRead(BTN_PIN4);
+    //1.4.2 Detect electrical Change
+    if(BTN4_Read != lastBTN4Read){
+        lastBTN4Read = BTN4_Read;
+        btn4BounceTime = millis();
+    }
+    //1.4.3 Check bounce time
+    if(millis() - btn4BounceTime >= DebounceDelay){
+        bool verifiedBTN4Read = digitalRead(BTN_PIN4);
+        //1.4.4 Verify stable state
+        if(verifiedBTN4Read != stableBTN4){
+            stableBTN4 = verifiedBTN4Read;
+            //1.4.5 Valid button pressing
+            if(stableBTN4 == LOW && !motionStart){
+                targetDistance -= 100;
+                //LCD Telemetry
+                lcd.setCursor(0,0);
+                lcd.print("Set D: ");
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("              ");
+            }
+        }
+    }
+    //=====================================================
+    //1.5.1 Button 5  -10mm
+    //1.5.2 Read electrical signal
+    bool BTN5_Read = digitalRead(BTN_PIN5);
+    //1.5.2 Detect electrical Change
+    if(BTN5_Read != lastBTN5Read){
+        lastBTN5Read = BTN5_Read;
+        btn5BounceTime = millis();
+    }
+    //1.5.3 Check bounce time
+    if(millis() - btn5BounceTime >= DebounceDelay){
+        bool verifiedBTN5Read = digitalRead(BTN_PIN5);
+        //1.5.4 Verify stable state
+        if(verifiedBTN5Read != stableBTN5){
+            stableBTN5 = verifiedBTN5Read;
+            //1.5.5 Valid button pressing
+            if(stableBTN5 == LOW && !motionStart){
+                targetDistance -= 10;
+                //LCD Telemetry
+                lcd.setCursor(0,0);
+                lcd.print("Set D: ");
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("              ");
+            }
+        }
+    }
+    //=====================================================
+    //1.6.1 Button 5  -1mm
+    //1.6.2 Read electrical signal
+    bool BTN6_Read = digitalRead(BTN_PIN6);
+    //1.6.2 Detect electrical Change
+    if(BTN6_Read != lastBTN6Read){
+        lastBTN6Read = BTN6_Read;
+        btn6BounceTime = millis();
+    }
+    //1.6.3 Check bounce time
+    if(millis() - btn6BounceTime >= DebounceDelay){
+        bool verifiedBTN6Read = digitalRead(BTN_PIN6);
+        //1.6.4 Verify stable state
+        if(verifiedBTN6Read != stableBTN6){
+            stableBTN6 = verifiedBTN6Read;
+            //1.6.5 Valid button pressing
+            if(stableBTN6 == LOW && !motionStart){
+                targetDistance--;
+                //LCD Telemetry
+                lcd.setCursor(0,0);
+                lcd.print("Set D: ");
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("              ");
+            }
+        }
+    }
+    //=====================================================
+    //1.7. Start/Pause Button
+    //1.7.1 
+    bool StartBTN_Read = digitalRead(BTN_PIN7);
+    //1.7.2
+    if(StartBTN_Read != lastStartRead){
+        lastStartRead = StartBTN_Read;
+        startBounceTime = millis();
+    }
+    //1.7.3
+    if(millis() - startBounceTime >= DebounceDelay){
+        bool verifiedStart = digitalRead(BTN_PIN7);
+        //1.7.4
+        if(verifiedStart != stableStart){
+            stableStart = verifiedStart;
+            if(stableStart == LOW){
+                motionStart = !motionStart;
+                if(motionStart){
+                    
+                    if(targetDistance > 0){
+                        isForward = true;
+                    }
+                    else{
+                        isForward = false;
+                    }
+                    targetStep = (unsigned long) (stepDistance * abs(targetDistance));
+
+                    // Safe guard for short distance
+                    unsigned long accelStepCal = (initialInterval - cruiseInterval) / Acceleration;
+                    accelStep = (accelStepCal > targetStep/2.)? targetStep/2. : accelStepCal;
+                    decelStep = targetStep - accelStep;
+
+                    //Reset counter
+                    currentStep = 0;
+                    stepInterval = initialInterval;
+                    MotionComplete = false;
+                    lastStepTime = micros();
+                }
+            }
+        }
+    }
+
+    //Stepper motion
+    if(motionStart){
+        //Stop motion when reach target
+        if(currentStep >= targetStep){
+            stepState = LOW;
+            digitalWrite(stepPin, stepState);
+            //Stop printing when motion finish
+            if(!MotionComplete){
+                Serial.print("-->Target reached: ");
+                Serial.print(targetDistance);
+                Serial.print(" mm <--");
+
+                lcd.setCursor(0,1);
+                lcd.print("Dist: ");
+                lcd.print(targetDistance);
+                lcd.print(" mm");
+                lcd.print("               ");
+                MotionComplete = true;
+            }
+            return;
+        }
+
+        //Non-blocking stepper motion
+        unsigned long currentStepTime = micros();
+        if(currentStepTime - lastStepTime >= stepInterval){
+            lastStepTime += stepInterval;
+            stepState = !stepState;
+            digitalWrite(stepPin, stepState? HIGH:LOW);
+            //Steps counter
+            if(stepState == HIGH){
+                currentStep++;
+                //Trapezoidal speed Profile
+                //Acceleration stage
+                if(currentStep < accelStep){
+                    if(stepInterval > cruiseInterval){
+                        stepInterval -= Acceleration;
+                    }
+                    else{
+                        stepInterval = cruiseInterval;
+                    }
+                }
+                //Cruise speed stage
+                if(currentStep >= accelStep && currentStep < decelStep){
+                    stepInterval = cruiseInterval;
+                }
+                //Deceleration stage
+                if(currentStep >= decelStep){
+                    stepInterval += Acceleration;
+                }
+            }
+        }
+        //Non-blocking Serial TELEMETRY
+        unsigned long currentSerialTime = millis();
+        if(currentSerialTime - lastSerialTime >= serialInterval){
+            lastSerialTime += serialInterval;
+            //Printing result
+            float currentSpeed = 60000000.0f / (stepsPerRev * (float)stepInterval * 2.0f);
+            float currentDistance = currentStep / (float) stepDistance;
+            float currentRev = (float) currentStep / stepsPerRev;
+            Serial.print(currentSpeed,2);
+            Serial.print("   |   ");
+            Serial.print(currentStep);
+            Serial.print("   |   ");
+            Serial.print(currentRev,2);
+            Serial.print("   |   ");
+            Serial.print(currentDistance,2);
+            Serial.println("mm");
+        }
+
+        //Non-bolcking LCD Refresh TELEMETRY
+        unsigned long currentLCDTime = millis();
+        if(currentLCDTime - lastLCDTime >= lcdInterval){
+            lastLCDTime += lcdInterval;
+
+            float currentDistance = currentStep / (float) stepDistance;
+            lcd.setCursor(0,1);
+            lcd.print("Dist: "); 
+            lcd.print(currentDistance);
+            lcd.print("mm");
+            lcd.print("               ");
+        }
+    }
+}
