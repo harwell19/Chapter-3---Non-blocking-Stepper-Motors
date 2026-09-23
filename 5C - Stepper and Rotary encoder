@@ -1,0 +1,315 @@
+/*
+Lesson 5 : Stepper - Trapezoidal speed profile with distance tunned by Rotary Encoder
+
+   Features: 
+   Non-blocking acceleration-> Cruise Speed -> Deceleration ramp (Trapezoidal Speed profile)
+   Triangle speed profile as Safe guard for short distances traveled
+   Distance tunned by protary encoder
+   Resolution button to change the distance Scale = 0.1mm -> 1mm -> 10mm -> 100mm
+   Start/Pause toggle switch 
+   Non-blocking telemetry
+
+   Author: Harwell Mejia
+
+   Tutor: GEMINI & ChatGPT
+   - Architecture : Dual Independent Non-Blocking Tasks
+   - Driver Type  : STEP / DIR
+   - Timebase     : micros() [Stepper] | millis() [Telemetry]
+
+   Date:
+   - 2026/09/23
+
+   Hardware: 
+   - 1x Arduino UNO
+   - 1x Stepper NEMA 17 
+   - 1x A4988 Stepper driver
+   - 1x LCD 16x2 
+   - 1x I2C lcd driver
+   - 2x push buttons
+   - 1x Rotary Encoder
+   
+   Compiled and run in Cirkit Designer
+   Simulation link:
+   https://app.cirkitdesigner.com/project/a2aa3fbd-f74e-4637-828d-9698089e9176
+*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define CLK_PIN 2
+#define DT_PIN 3
+#define RES_BTN 4
+#define DIR_PIN 6
+#define STEP_PIN 7
+#define SW_PIN 8
+#define stepsPerRev 200
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+//==Motion state parameters
+bool motionStart = false;
+bool motionComplete = false;
+bool stepState = LOW;
+bool isClockwise = true;
+
+const unsigned int initialSpeed = 5; //in [RPM]
+const unsigned int cruiseSpeed = 120; //in [RPM]
+unsigned long initialInterval;       // [uS/Steps]
+unsigned long cruiseInterval;
+const int Acceleration = 50;        // [uS/Steps^2]
+unsigned long accelStep;            // [steps]
+unsigned long decelStep;
+//==Distance parameters and variables
+float targetDistance = 0; //Given by the rotary encoder
+unsigned long targetSteps; //TS = maxDistance x SD
+unsigned long currentStep = 0;
+//Belt GT2 Parameters
+const int pitch = 2; //P[mm]
+const int theetNumber = 20; // Z number of theet per Rev [1/rev]
+float distancePerRev; //DPR = p x Z [mm/rev]
+float stepDistance; // SD = SPR/DPS
+//Non-blocking stepper parameters
+unsigned long stepInterval;
+unsigned long lastStepTime = 0;
+
+//Rotary encoder variable and parameters
+bool lastCLKState;
+int resolutionIndex = 0; //for 0.1,1,10&100
+float resolutions[] = {0.1f, 1.0f, 10.0f, 100.0f};
+
+//Non-blocking Resolution Button
+bool lastResRead = HIGH;
+bool stableRESState = HIGH;
+unsigned long resBounceTime = 0;
+//Non-blocking Start-pause button
+bool lastSWRead = HIGH;
+bool stableSWState = HIGH;
+unsigned long swBounceTime = 0;
+
+const unsigned long debounceDelay = 50; //Delay time for all button Bouncing
+//Non-blocking LCD Refresh
+unsigned long lastLCDTime = 0;
+const unsigned long lcdInterval = 250;
+//Non-blocking Serial telemetry
+unsigned long lastSerialTime = 0;
+unsigned long serialInterval = 250;
+
+void setup(){
+    Serial.begin(115200);
+    pinMode(CLK_PIN, INPUT_PULLUP);
+    pinMode(DT_PIN, INPUT_PULLUP);
+    pinMode(RES_BTN, INPUT_PULLUP);
+    pinMode(SW_PIN, INPUT_PULLUP);
+    pinMode(DIR_PIN, OUTPUT);
+    pinMode(STEP_PIN, OUTPUT);
+    lcd.begin(16,2);
+    lcd.backlight();
+    //Initial state
+        // Belt calculation
+    distancePerRev = pitch * theetNumber; // [mm/Rev]
+    stepDistance = stepsPerRev / distancePerRev; //[steps/mm]
+    targetSteps = (unsigned long) (stepDistance * abs(targetDistance));  // [steps]
+
+        //Stepper
+    lastStepTime = micros();
+    digitalWrite(DIR_PIN, HIGH);
+    digitalWrite(STEP_PIN, LOW);
+
+    initialInterval = 60000000UL / (stepsPerRev * initialSpeed * 2UL);
+    cruiseInterval = 60000000UL / (stepsPerRev * cruiseSpeed * 2UL);
+    stepInterval = initialInterval;
+    accelStep = (initialInterval - cruiseInterval) / Acceleration;
+    decelStep = targetSteps - accelStep;
+            //Safe guard for short distance -> Avoid truncated trapezoidal speed profile
+    unsigned long calcAccelStep = (initialInterval - cruiseInterval) / Acceleration;
+    accelStep = (calcAccelStep >= targetSteps/2.)? targetSteps/2. : calcAccelStep;
+    decelStep = targetSteps - accelStep;
+            //Set stepper direction
+    if(targetDistance > 0){
+        isClockwise = true;
+        digitalWrite(DIR_PIN, isClockwise);
+    }
+    else{
+        isClockwise = false;
+        digitalWrite(DIR_PIN, LOW);
+    }
+
+        //Rotary encoder
+    lastCLKState = digitalRead(CLK_PIN);
+        //Telemetry
+    Serial.println("\nWelcome to Arduino - State Machine Series **Stepper** ");
+    Serial.println("By Harwell Mejia");
+    Serial.println("Step  |  RPM  | Revs  | Dist");
+    updateLCD();
+}
+void loop(){
+    //Task 1 - Activate Rotary encoder
+    bool currentCLKState = digitalRead(CLK_PIN);
+    //detect electrical change
+    if(currentCLKState != lastCLKState){
+        //Valid change
+        if(currentCLKState == LOW){
+            //Set direction
+            if(digitalRead(DT_PIN) == HIGH){
+                targetDistance += resolutions[resolutionIndex];
+            }
+            else{
+                targetDistance -= resolutions[resolutionIndex];
+            }
+            //R-E Telemetry
+            updateLCD();
+            Serial.print("Distance: ");
+            Serial.println(targetDistance);
+        }
+        lastCLKState = currentCLKState;
+    }
+    //Task 2 - Non-blocking Resolution button
+        //2.1 Read value
+    bool currentResRead = digitalRead(RES_BTN);
+        //2.2 - Detec electrical change
+    if(currentResRead != lastResRead){
+        lastResRead = currentResRead;
+        resBounceTime = millis();
+    }
+        //2.3 - Check bounce time
+    if(millis() - resBounceTime >= debounceDelay){
+        bool verifiedResState = digitalRead(RES_BTN);
+        //2.4 - Check stable state
+        if(verifiedResState != stableRESState){
+            stableRESState = verifiedResState;
+            //2.5 - Valid button press
+            if(stableRESState == LOW){
+                resolutionIndex = (resolutionIndex + 1) % 4;
+                updateLCD();
+                Serial.print("Resolution: ");
+                Serial.print(resolutions[resolutionIndex]);
+                Serial.println("mm");
+            }
+        }
+    }
+    //Task 3 - Non-blocking Start/Pause button
+    //3.1
+    bool currentSWRead = digitalRead(SW_PIN);
+    //3.2
+    if(currentSWRead != lastSWRead){
+        lastSWRead = currentSWRead;
+        swBounceTime = millis();
+    }
+    //3.3
+    if(millis() - swBounceTime >= debounceDelay){
+        bool verifiedSWState = digitalRead(SW_PIN);
+        //3.4 
+        if(verifiedSWState != stableSWState){
+            stableSWState = verifiedSWState;
+            //3.5
+            if(stableSWState == LOW){
+                motionStart = !motionStart;
+                if(motionStart){
+                    //Set direction
+                    if(targetDistance > 0){
+                        isClockwise = true;
+                    }
+                    else{
+                        isClockwise = false;
+                    }
+                    targetSteps = (unsigned long)(stepDistance * abs(targetDistance));
+                    //Safe guar for short distance
+                    unsigned long calcAccelStep = (initialInterval - cruiseInterval) / Acceleration;
+                    accelStep = (calcAccelStep >= targetSteps / 2.)? targetSteps/2. : calcAccelStep;
+                    decelStep = targetSteps - accelStep;
+                    
+                    //Reset count
+                    currentStep = 0;
+                    stepInterval = initialInterval;
+                    motionComplete = false;
+                    lastStepTime = micros();
+                }
+            }
+        }
+    }
+    //==Task 4 - Stepper motion
+    if(motionStart){
+        //Maximum distance traveled
+        if(currentStep >= targetSteps){
+            stepState = LOW;
+            digitalWrite(STEP_PIN, LOW);
+            //Telemetry when stepper reach the max distance
+            if(!motionComplete){
+                //Max distance telemetry
+                Serial.print("-->Max distance reached: ");
+                Serial.print(targetDistance);
+                Serial.println("mm");
+                lcd.setCursor(0,1);
+                lcd.print("D: "); //Current Traveled distace
+                lcd.print(targetDistance);
+                lcd.print("mm");
+                motionComplete = true;
+            }
+            return;
+        }
+        //Non-blocking stepper
+        unsigned long currentStepTime = micros();
+        if(currentStepTime - lastStepTime >= stepInterval){
+            lastStepTime += stepInterval;
+            stepState = !stepState;
+            digitalWrite(STEP_PIN, stepState? HIGH:LOW);
+            //Count Step
+            if(stepState == HIGH){
+                currentStep++;
+                //-->Core code for the Trapezoidal Speed profile <--
+                    //Acceleration Stage
+                if(currentStep < accelStep){
+                    if(stepInterval > cruiseInterval){
+                        stepInterval -= Acceleration;
+                    }
+                    else{
+                        stepInterval = cruiseInterval;
+                    }
+                }
+                    //Cruise speed Stage
+                else if(currentStep >= accelStep && currentStep < decelStep){
+                    stepInterval = cruiseInterval;
+                }
+                //Breaking Stage
+                else if(currentStep >= decelStep){
+                    stepInterval += Acceleration;
+                }
+            }
+        }
+        //== Task 5 - Telemetry
+        unsigned long currentSerialTime = millis();
+        if(currentSerialTime - lastSerialTime >= serialInterval){
+            float currentSpeed = 60000000.0f / ((float)stepInterval * stepsPerRev * 2.0f);
+            float currentRev = (float) currentStep / stepsPerRev;
+            float currentDistance = currentStep / (float) stepDistance;
+            Serial.print(currentStep);
+            Serial.print(" | ");
+            Serial.print(currentSpeed, 2);
+            Serial.print(" | ");
+            Serial.print(currentRev, 2);
+            Serial.print(" | ");
+            Serial.println(currentDistance, 2);
+        }
+        unsigned long currentLCDTime = millis();
+        if(currentLCDTime - lastLCDTime >= lcdInterval){
+            lastLCDTime += lcdInterval;
+            //Line 2
+        float currentDistance = currentStep / (float) stepDistance;
+        lcd.setCursor(0,1);
+        lcd.print("D: "); //Current Traveled distace
+        lcd.print(currentDistance);
+        lcd.print("mm            ");
+        }
+    }      
+}
+void updateLCD(){
+    //Line 1
+    lcd.setCursor(0,0);
+    lcd.print("Set D: ");
+    lcd.print(targetDistance);
+    lcd.print("mm");
+    lcd.print("          ");
+    //Line 2
+    float currentDistance = currentStep / (float) stepDistance;
+    lcd.setCursor(0,1);
+    lcd.print("D: "); //Current Traveled distace
+    lcd.print(currentDistance);
+    lcd.print("mm            ");
+}
