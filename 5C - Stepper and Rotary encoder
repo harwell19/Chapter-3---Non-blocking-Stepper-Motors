@@ -276,6 +276,7 @@ void loop(){
         //== Task 5 - Telemetry
         unsigned long currentSerialTime = millis();
         if(currentSerialTime - lastSerialTime >= serialInterval){
+            lastSerialTime += serialInterval;
             float currentSpeed = 60000000.0f / ((float)stepInterval * stepsPerRev * 2.0f);
             float currentRev = (float) currentStep / stepsPerRev;
             float currentDistance = currentStep / (float) stepDistance;
